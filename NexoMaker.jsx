@@ -1,0 +1,698 @@
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { 
+  LayoutDashboard, ShoppingCart, Users, FileText, Settings,
+  Plus, Search, Trash2, Edit, X, CheckCircle, Clock, 
+  Printer, Download, LogOut, Box, PieChart as PieChartIcon, 
+  Image as ImageIcon, Package, UploadCloud, ChevronDown, ChevronRight, ChevronUp,
+  Moon, Sun, User, Lock, Shield, AlertCircle, List, Grid,
+  Calendar, DollarSign, TrendingUp, Menu, Eye, Filter,
+  CreditCard, CheckSquare, AlertTriangle, BarChart2, Activity,
+  Save, RefreshCw, AlertOctagon
+} from 'lucide-react';
+import { 
+  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
+  LineChart, Line, CartesianGrid, Legend, AreaChart, Area,
+  PieChart, Pie, Cell, ComposedChart
+} from 'recharts';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, signInWithCustomToken, signInAnonymously, 
+  onAuthStateChanged, signOut 
+} from 'firebase/auth';
+import { 
+  getFirestore, collection, addDoc, updateDoc, deleteDoc, 
+  doc, onSnapshot, query, orderBy, serverTimestamp, setDoc 
+} from 'firebase/firestore';
+
+// --- CONFIGURACIÓN ---
+
+// *******************************************************************
+// <-- MODIFICACIÓN CLAVE AQUÍ: Hemos reescrito la configuración 
+// para incluir valores de ejemplo, ignorando la variable global.
+// DEBES REEMPLAZAR ESTE OBJETO CON EL TUYO REAL DE FIREBASE.
+// *******************************************************************
+const FIREBASE_CONFIG_MANUAL = {
+    apiKey: "AIzaSyC9iwKD6jJk9oDcmRgiCTkjezS4Dx_sSYo",    
+    authDomain: "nexomaker-6fb11.firebaseapp.com",
+    databaseURL: "https://nexomaker-6fb11-default-rtdb.firebaseio.com",    
+    storageBucket: "nexomaker-3d-app.appspot.com",
+    projectId: "nexomaker-6fb11",
+    storageBucket: "nexomaker-6fb11.firebasestorage.app",
+    messagingSenderId: "190254879282",
+    appId: "1:190254879282:web:6bd3f1a9ae66af8d7ce22b",
+    measurementId: "G-8SKXD8W6R1"
+
+};
+
+// Usamos la configuración manual para la inicialización
+const firebaseConfig = FIREBASE_CONFIG_MANUAL; 
+const app = initializeApp(firebaseConfig);
+
+// La única variable global que mantenemos es __app_id, 
+// o un valor fijo si se usa en otro entorno.
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+const auth = getAuth(app);
+const db = getFirestore(app);
+// -------------------------------------------------------------------
+
+
+/**
+ * Carga la librería html2pdf.js para la exportación de facturas a PDF.
+ */
+const loadPdfLibrary = () => {
+  if (!window.html2pdf) {
+    const script = document.createElement('script');
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js";
+    script.async = true;
+    document.body.appendChild(script);
+  }
+};
+
+// --- UTILIDADES ---
+
+/**
+ * Formatea un número a formato de moneda dominicana (o el símbolo definido).
+ */
+const formatCurrency = (amount, symbol = 'RD$') => {
+  const num = Number(amount);
+  if (isNaN(num)) return `${symbol} 0.00`;
+  return new Intl.NumberFormat('es-DO', { style: 'currency', currency: 'DOP', currencyDisplay: 'code' }).format(num).replace('DOP', symbol).trim();
+};
+
+/**
+ * Formatea un timestamp de Firebase a una cadena de fecha legible en español.
+ */
+const formatDate = (timestamp) => {
+  if (!timestamp) return new Date().toLocaleDateString('es-ES');
+  let date;
+  try { date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp); } catch(e) { date = new Date(); }
+  return date.toLocaleDateString('es-ES', { day: '2-digit', month: 'long', year: 'numeric' });
+};
+
+/**
+ * Procesa y comprime una imagen cargada por el usuario a Base64.
+ */
+const processImage = (file) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.readAsDataURL(file);
+  reader.onload = (e) => { 
+    const img = new Image();
+    img.src = e.target.result;
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      const MAX_W = 800, MAX_H = 800;
+      let w = img.width, h = img.height;
+      if (w > h) { if (w > MAX_W) { h *= MAX_W / w; w = MAX_W; } } 
+      else { if (h > MAX_H) { w *= MAX_H / h; h = MAX_H; } }
+      canvas.width = w; canvas.height = h;
+      ctx.clearRect(0, 0, w, h); 
+      ctx.drawImage(img, 0, 0, w, h);
+      const type = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
+      const quality = file.type === 'image/png' ? undefined : 0.7;
+      resolve(canvas.toDataURL(type, quality));
+    };
+  };
+  reader.onerror = reject;
+});
+
+/**
+ * Formatea las dimensiones de milímetros (mm) a centímetros (cm) con un decimal.
+ */
+const formatDims = (x, y, z) => (!x && !y && !z) ? 'N/A' : `X:${(x/10).toFixed(1)} Y:${(y/10).toFixed(1)} Z:${(z/10).toFixed(1)} cm`;
+
+/**
+ * Genera un ID de cotización con el prefijo NM.
+ */
+const generateQuoteId = (total) => `NM${String(total + 1).padStart(4, '0')}`;
+
+// --- COMPONENTES UI ---
+
+const Card = ({ children, className = '' }) => (
+  <div className={`bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 transition-colors ${className}`}>{children}</div>
+);
+
+const Badge = ({ status }) => {
+  let styles = 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300', text = 'Pendiente', Icon = AlertCircle;
+  if (status === 'pagado') { styles = 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'; text = 'Pagado'; Icon = CheckCircle; }
+  else if (status === 'parcial') { styles = 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400'; text = 'En Proceso'; Icon = PieChartIcon; }
+  return <span className={`px-2 py-1 rounded-full text-xs font-bold border border-transparent flex items-center gap-1 w-fit ${styles}`}><Icon size={12}/> {text}</span>;
+};
+
+const TimePicker = ({ value, onChange }) => {
+  const [h, setH] = useState(0);
+  const [m, setM] = useState(0);
+  useEffect(() => { if(value) { const hm = value.match(/(\d+)h (\d+)m/); if(hm) { setH(parseInt(hm[1])); setM(parseInt(hm[2])); } } }, [value]);
+  const up = (nh, nm) => { setH(nh); setM(nm); onChange(`${nh}h ${nm}m`); };
+  return (
+    <div className="flex gap-1 items-center">
+      <select value={h} onChange={e=>up(parseInt(e.target.value),m)} className="p-1 border rounded dark:bg-slate-700 text-sm dark:text-white dark:border-slate-600">{[...Array(100).keys()].map(x=><option key={x} value={x}>{x}h</option>)}</select>
+      <select value={m} onChange={e=>up(h,parseInt(e.target.value))} className="p-1 border rounded dark:bg-slate-700 text-sm dark:text-white dark:border-slate-600">{[...Array(60).keys()].map(x=><option key={x} value={x}>{x}m</option>)}</select>
+    </div>
+  );
+};
+
+// --- APP MAIN ---
+export default function NexoMakerApp() {
+  const [user, setUser] = useState(null);
+  const [appUser, setAppUser] = useState(null);
+  const [view, setView] = useState('dashboard');
+  const [darkMode, setDarkMode] = useState(false);
+  const [data, setData] = useState({ orders: [], clients: [], products: [], staff: [] });
+  const [settings, setSettings] = useState({ currencySymbol: 'RD$', companyName: 'NexoMaker3D', taxId: '', logoUrl: '' });
+  const [loading, setLoading] = useState(true);
+  const [profileOpen, setProfileOpen] = useState(false);
+  
+  // Estado global para confirmación de eliminación
+  const [confirmData, setConfirmData] = useState({ isOpen: false, title: '', msg: '', action: null });
+
+  useEffect(() => { loadPdfLibrary(); }, []);
+  useEffect(() => { document.documentElement.classList.toggle('dark', darkMode); }, [darkMode]);
+
+  // Auth Init
+  useEffect(() => {
+    const init = async () => { 
+      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        await signInWithCustomToken(auth, __initial_auth_token); 
+      } else {
+        await signInAnonymously(auth); 
+      }
+    };
+    init();
+    return onAuthStateChanged(auth, setUser);
+  }, []);
+
+  // Data Sync
+  useEffect(() => {
+    if (!user) return;
+    const unsubs = ['orders', 'clients', 'products', 'staff'].map(c => 
+       onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', c), orderBy('createdAt', 'desc')), s => {
+          setData(p => ({ ...p, [c]: s.docs.map(d => ({ id: d.id, ...d.data() })) }));
+          setLoading(false);
+       }, (error) => console.error("Error fetching " + c, error))
+    );
+    // Configuración es un documento único, no una colección.
+    unsubs.push(onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config'), s => { if (s.exists()) setSettings(p => ({ ...p, ...s.data() })) }));
+    return () => unsubs.forEach(u => u());
+  }, [user]);
+
+  // Admin Init: Si no hay staff, crea un usuario por defecto
+  useEffect(() => {
+    if (!loading && data.staff.length === 0 && user) {
+       addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'staff'), { name: 'Ernis', password: 'admin', role: 'admin', photo: '', preferences: { chartType: 'area' }, createdAt: serverTimestamp() });
+    }
+  }, [loading, data.staff, user]);
+
+  /**
+   * Función central para operaciones CRUD. Usamos useCallback para memoizar.
+   */
+  const handleCRUD = useCallback((col, op, pl, id) => {
+     const ref = collection(db, 'artifacts', appId, 'public', 'data', col);
+     if (op === 'add') addDoc(ref, pl);
+     if (op === 'upd') updateDoc(doc(ref, id), pl);
+     if (op === 'del') {
+       // Usamos el modal personalizado en lugar de la alerta nativa
+       setConfirmData({
+         isOpen: true,
+         title: '¿Eliminar elemento?', // Corregido
+         msg: 'Esta acción no se puede deshacer. ¿Estás seguro?', // Corregido
+         action: () => {
+           deleteDoc(doc(ref, id)).catch(err => console.error("Error al eliminar: " + err.message)); // Corregido a console.error en lugar de alert
+           setConfirmData({ isOpen: false, title: '', msg: '', action: null });
+         }
+       });
+     }
+  }, [setConfirmData]); // Dependencia del estado del modal
+
+  const handleLogin = (u, p) => {
+     const found = data.staff.find(x => x.name.toLowerCase() === u.toLowerCase() && x.password === p);
+     found ? setAppUser(found) : console.error("Credenciales incorrectas. (Ernis/admin)"); // Corregido a console.error
+  };
+
+  const LogoImg = ({ size = 'h-8', className='' }) => settings.logoUrl ? <img src={settings.logoUrl} className={`${size} w-auto object-contain ${className}`}/> : <Box className={`text-teal-600 ${className}`} />;
+
+  if (!appUser) return (
+    <div className="min-h-screen flex items-center justify-center bg-slate-100 dark:bg-slate-900 p-4 transition-colors">
+       <Card className="w-full max-w-md p-8 text-center space-y-6">
+          <div className="mx-auto w-28 h-28 bg-white rounded-full flex items-center justify-center mb-4 border-4 border-teal-500 shadow-lg overflow-hidden p-4"><LogoImg size="h-full" className="w-full"/></div>
+          <h1 className="text-2xl font-bold text-slate-800 dark:text-white">{settings.companyName}</h1>
+          <form onSubmit={e=>{e.preventDefault(); handleLogin(e.target.u.value, e.target.p.value)}} className="space-y-4 text-left">
+             <div><label className="text-sm font-bold dark:text-slate-300">Usuario</label><input name="u" className="w-full p-3 border rounded dark:bg-slate-700 dark:text-white dark:border-slate-600" autoFocus/></div>
+             <div><label className="text-sm font-bold dark:text-slate-300">Contraseña</label><input name="p" type="password" className="w-full p-3 border rounded dark:bg-slate-700 dark:text-white dark:border-slate-600"/></div>
+             <button className="w-full bg-teal-600 text-white py-3 rounded font-bold hover:bg-teal-700 shadow-lg transition">Ingresar</button>
+          </form>
+          <p className="text-xs text-slate-400">{loading ? 'Conectando...' : 'Sistema Seguro'}</p>
+       </Card>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 font-sans flex transition-colors pb-20 md:pb-0">
+       <aside className="hidden md:flex flex-col w-64 bg-white dark:bg-slate-800 border-r dark:border-slate-700 h-screen fixed z-20">
+          <div className="p-6 flex items-center gap-2 text-teal-700 dark:text-teal-400 font-bold text-xl"><LogoImg/> {settings.companyName}</div>
+          <div onClick={()=>setProfileOpen(true)} className="mx-4 mb-4 p-3 bg-slate-50 dark:bg-slate-700/50 rounded-lg cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-700 transition flex items-center gap-3 border dark:border-slate-600 group">
+             {appUser.photo ? <img src={appUser.photo} className="w-10 h-10 rounded-full object-cover border border-teal-500"/> : <div className="w-10 h-10 rounded-full bg-teal-100 text-teal-700 flex items-center justify-center font-bold border border-teal-500">{appUser.name[0]}</div>}
+             <div className="overflow-hidden"><p className="font-bold text-sm truncate group-hover:text-teal-600">{appUser.name}</p><p className="text-xs text-slate-500 capitalize">{appUser.role}</p></div>
+             <Settings size={14} className="ml-auto text-slate-400"/>
+          </div>
+          <nav className="px-4 space-y-1 flex-1">
+             {[{id:'dashboard',i:<LayoutDashboard/>,l:'Inicio'},{id:'orders',i:<ShoppingCart/>,l:'Cotizaciones'},{id:'products',i:<Package/>,l:'Inventario'},{id:'clients',i:<Users/>,l:'Clientes'},{id:'invoices',i:<FileText/>,l:'Facturas'},{id:'settings',i:<Settings/>,l:'Ajustes'}].map(x=>(
+                <button key={x.id} onClick={()=>setView(x.id)} className={`flex items-center gap-3 px-4 py-3 rounded-lg w-full transition ${view===x.id?'bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-400 font-bold':'text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'}`}>{React.cloneElement(x.i,{size:20})}<span>{x.l}</span></button>
+             ))}
+          </nav>
+          <div className="p-4 border-t dark:border-slate-700 space-y-2">
+             <button onClick={()=>setDarkMode(!darkMode)} className="flex justify-between w-full px-4 py-2 text-sm text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded"><span>{darkMode?'Claro':'Oscuro'}</span>{darkMode?<Sun size={16}/>:<Moon size={16}/>}</button>
+             <button onClick={()=>setAppUser(null)} className="flex gap-2 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20 w-full px-4 py-2 text-sm rounded"><LogOut size={16}/> Salir</button>
+          </div>
+       </aside>
+
+       <header className="md:hidden fixed top-0 w-full bg-white dark:bg-slate-800 p-4 border-b dark:border-slate-700 z-20 flex justify-between items-center shadow-sm">
+          <span className="font-bold text-teal-700 flex gap-2 items-center"><LogoImg size="h-6"/> {settings.companyName}</span>
+          {/* CORRECCIÓN: Se añadió un espacio a la fuerza en el componente LogOut para evitar el error de parsing JSX */}
+          <div className="flex gap-3"><button onClick={()=>setDarkMode(!darkMode)}>{darkMode?<Sun className="text-yellow-400"/>:<Moon className="text-slate-600" />}</button><button onClick={()=>setAppUser(null)}><LogOut className="text-slate-400" /></button></div>
+       </header>
+
+       <main className="flex-1 md:ml-64 p-4 md:p-8 mt-16 md:mt-0 max-w-7xl mx-auto w-full">
+          {view==='dashboard' && <DashboardView orders={data.orders} settings={settings} />}
+          {view==='products' && <ProductsView products={data.products} settings={settings} crud={handleCRUD} />}
+          {view==='clients' && <ClientsView clients={data.clients} crud={handleCRUD} />}
+          {view==='orders' && <OrdersView orders={data.orders} clients={data.clients} products={data.products} settings={settings} user={appUser} crud={handleCRUD} />}
+          {view==='invoices' && <InvoiceView orders={data.orders} settings={settings} />}
+          {view==='settings' && <SettingsView settings={settings} staff={data.staff} user={appUser} updateSet={(d)=>setDoc(doc(db,'artifacts',appId,'public','data','settings','config'),d,{merge:true})} crud={handleCRUD} />}
+       </main>
+
+       <nav className="md:hidden fixed bottom-0 w-full bg-white dark:bg-slate-800 border-t dark:border-slate-700 flex justify-around p-2 z-30 pb-safe shadow">
+          {['dashboard','orders','products','invoices'].map(id=><button key={id} onClick={()=>setView(id)} className={`p-2 flex flex-col items-center ${view===id?'text-teal-600':'text-slate-400'}`}>{id==='dashboard'?<LayoutDashboard size={20}/>:id==='orders'?<ShoppingCart size={20}/>:id==='products'?<Package size={20}/>:<FileText size={20}/>}</button>)}
+          <button onClick={()=>setProfileOpen(true)} className="p-2 text-slate-400"><User size={20}/></button>
+       </nav>
+
+       {profileOpen && <ProfileModal user={appUser} close={()=>setProfileOpen(false)} update={(d)=>handleCRUD('staff','upd',d,appUser.id)} />}
+       
+       {/* Modal de Confirmación Global */}
+       {confirmData.isOpen && (
+         <div className="fixed inset-0 bg-black/50 z-[60] flex items-center justify-center p-4 backdrop-blur-sm animate-fade-in">
+           <Card className="w-full max-w-sm p-6 space-y-4">
+             <div className="flex items-center gap-3 text-rose-600">
+               <div className="p-3 bg-rose-100 dark:bg-rose-900/30 rounded-full"><AlertOctagon size={24}/></div>
+               <h3 className="font-bold text-lg dark:text-white">{confirmData.title}</h3>
+             </div>
+             <p className="text-slate-500 dark:text-slate-300">{confirmData.msg}</p>
+             <div className="flex gap-3 pt-2">
+               <button onClick={()=>setConfirmData({...confirmData, isOpen: false})} className="flex-1 px-4 py-2 bg-slate-200 dark:bg-slate-700 dark:text-white rounded font-bold">Cancelar</button>
+               <button onClick={confirmData.action} className="flex-1 px-4 py-2 bg-rose-600 text-white rounded font-bold hover:bg-rose-700">Sí, Eliminar</button>
+             </div>
+           </Card>
+         </div>
+       )}
+
+       <style>{`.pb-safe { padding-bottom: env(safe-area-inset-bottom, 20px); }`}</style>
+    </div>
+  );
+}
+
+// --- SUB-COMPONENTES ---
+
+const ProfileModal = ({ user, close, update }) => {
+  const fileRef = useRef();
+  const [img, setImg] = useState(user.photo);
+  const save = (e) => {
+     e.preventDefault(); const pass = e.target.pass.value;
+     const d = { photo: img }; if(pass) d.password = pass;
+     update(d); user.photo = img; if(pass) user.password = pass;
+     close(); 
+     console.info("Perfil actualizado");
+  };
+  return (
+    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
+       <Card className="w-full max-w-sm p-6">
+          <div className="flex justify-between items-center mb-4"><h3 className="font-bold text-lg dark:text-white">Mi Perfil</h3><button onClick={close}><X/></button></div>
+          <form onSubmit={save} className="space-y-4">
+             <div className="flex flex-col items-center gap-2"><div onClick={()=>fileRef.current.click()} className="w-24 h-24 rounded-full border-2 border-dashed flex items-center justify-center cursor-pointer overflow-hidden relative hover:opacity-80 group bg-slate-100 dark:bg-slate-700">{img ? <img src={img} className="w-full h-full object-cover"/> : <User size={40} className="text-slate-300"/>}<div className="absolute bottom-0 bg-black/50 w-full text-center text-white text-xs py-1 opacity-0 group-hover:opacity-100">Cambiar</div></div><input ref={fileRef} type="file" className="hidden" onChange={async(e)=>{if(e.target.files[0]) setImg(await processImage(e.target.files[0]))}}/></div>
+             <div><label className="text-xs font-bold dark:text-slate-300">Nueva Contraseña</label><input name="pass" className="w-full p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Dejar vacío para mantener"/></div>
+             <button className="w-full bg-teal-600 text-white py-2 rounded font-bold hover:bg-teal-700">Guardar</button>
+          </form>
+       </Card>
+    </div>
+  )
+};
+
+const DashboardView = ({ orders, settings }) => {
+   const [range, setRange] = useState('week');
+   const [mode, setMode] = useState('charts'); 
+   const [chartLayout, setChartLayout] = useState('combined');
+   const [chartType, setChartType] = useState('area');
+   const [expandedRow, setExpandedRow] = useState(null);
+   const [expandedOrder, setExpandedOrder] = useState(null); 
+
+   const { chartData, stats, groupedOrders } = useMemo(() => {
+      const now = new Date(), grouped = {}, ordersByKey = {}, prodSales = {};
+      let total=0, paid=0, open=0, completed=0;
+      orders.forEach(o => {
+         const d = o.createdAt?.toDate ? o.createdAt.toDate() : new Date();
+         let key = '';
+         
+         // Lógica de Agrupamiento
+         if(range==='day' && d.getDate()===now.getDate() && d.getMonth()===now.getMonth() && d.getFullYear()===now.getFullYear()) {
+             key = `${String(d.getHours()).padStart(2, '0')}:00`;
+         }
+         if(range==='week') { 
+            const diff = Math.ceil((Math.abs(now-d))/(1000*60*60*24)); 
+            if(diff <= 7) key = ['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'][d.getDay()]; // Corregido: Mié, Sáb
+         }
+         if(range==='month' && d.getMonth()===now.getMonth()) key = `Día ${d.getDate()}`;
+         if(range==='year' && d.getFullYear()===now.getFullYear()) key = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'][d.getMonth()];
+         
+         if(key) {
+            if(!grouped[key]) grouped[key] = { name: key, ventas: 0, ingresos: 0, deuda: 0 };
+            if(!ordersByKey[key]) ordersByKey[key] = [];
+            ordersByKey[key].push(o);
+            grouped[key].ventas += o.total;
+            const p = (o.payments?.reduce((s,p)=>s+p.amount,0) || o.amountPaid || 0);
+            grouped[key].ingresos += p;
+            grouped[key].deuda += (o.total - p);
+         }
+         
+         // Estadísticas globales
+         total += o.total;
+         const pGlobal = (o.payments?.reduce((s,p)=>s+p.amount,0) || o.amountPaid || 0);
+         paid += pGlobal;
+         if(o.status === 'pagado') completed++; else open++;
+         o.items?.forEach(i => prodSales[i.name] = (prodSales[i.name]||0) + 1);
+      });
+      const pieData = Object.entries(prodSales).map(([name, value]) => ({ name, value })).sort((a,b)=>b.value-a.value).slice(0,5);
+      return { chartData: Object.values(grouped), stats: { total, paid, open, completed, pieData }, groupedOrders: ordersByKey };
+   }, [orders, range]);
+
+   const CommonChart = ({ dataKey, color, name, type }) => {
+       const T = type || chartType;
+       const C = T==='bar' ? BarChart : (T==='line' ? LineChart : AreaChart);
+       const D = T==='bar' ? Bar : (T==='line' ? Line : Area);
+       return (
+          <ResponsiveContainer width="100%" height="100%">
+             <C data={chartData}>
+                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#94a3b8"/>
+                <XAxis dataKey="name"/><YAxis/><Tooltip contentStyle={{backgroundColor:'#1e293b', border:'none', color:'white'}}/><Legend/>
+                <D type="monotone" dataKey={dataKey} stroke={color} fill={color} fillOpacity={0.3} name={name} />
+             </C>
+          </ResponsiveContainer>
+       );
+   }
+
+   const renderCombinedMainChart = () => {
+       if (chartType === 'bar') return <Bar dataKey="ventas" fill="#14b8a6" name="Ventas" />;
+       if (chartType === 'line') return <Line type="monotone" dataKey="ventas" stroke="#0d9488" strokeWidth={3} name="Ventas" />;
+       return <Area type="monotone" dataKey="ventas" stroke="#0d9488" fill="#14b8a6" fillOpacity={0.2} name="Ventas" />;
+   };
+
+   return (
+      <div className="space-y-6">
+         {/* Corrección: Uso consistente de tildes en el texto del dashboard */}
+         <div className="flex flex-col md:flex-row justify-between items-center gap-4"><h2 className="text-2xl font-bold dark:text-white">Dashboard</h2><div className="flex gap-2 flex-wrap justify-end">{mode==='charts' && (<div className="flex bg-white dark:bg-slate-800 p-1 rounded border dark:border-slate-700 gap-1"><button onClick={()=>setChartType('area')} className={`p-2 rounded ${chartType==='area'?'bg-teal-100 text-teal-700':'text-slate-500 dark:text-white'}`}><Activity size={16}/></button><button onClick={()=>setChartType('bar')} className={`p-2 rounded ${chartType==='bar'?'bg-teal-100 text-teal-700':'text-slate-500 dark:text-white'}`}><BarChart2 size={16}/></button><button onClick={()=>setChartType('line')} className={`p-2 rounded ${chartType==='line'?'bg-teal-100 text-teal-700':'text-slate-500 dark:text-white'}`}><TrendingUp size={16}/></button><div className="w-px bg-slate-300 dark:bg-slate-600 mx-1"></div><button onClick={()=>setChartLayout('combined')} className={`px-3 py-1 rounded text-sm ${chartLayout==='combined'?'bg-teal-100 text-teal-700':'text-slate-500 dark:text-white'}`}>Unificado</button><button onClick={()=>setChartLayout('split')} className={`px-3 py-1 rounded text-sm ${chartLayout==='split'?'bg-teal-100 text-teal-700':'text-slate-500 dark:text-white'}`}>Separado</button></div>)}<button onClick={()=>setMode(mode==='charts'?'list':'charts')} className="px-3 py-1 bg-white dark:bg-slate-800 border dark:border-slate-700 rounded text-sm hover:bg-slate-50 dark:text-white">{mode==='charts'?'Ver Texto':'Ver Gráficos'}</button><div className="flex bg-white dark:bg-slate-800 p-1 rounded border dark:border-slate-700">{['day','week','month','year'].map(r=><button key={r} onClick={()=>setRange(r)} className={`px-3 py-1 rounded capitalize text-sm ${range===r?'bg-teal-600 text-white':'text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700'}`}>{r==='day'?'Día':r==='week'?'Semana':r==='month'?'Mes':'Año'}</button>)}</div></div></div>
+         <div className="grid grid-cols-2 md:grid-cols-5 gap-4"><Card className="p-4 border-l-4 border-teal-500 md:col-span-1"><p className="text-xs font-bold uppercase text-slate-400">Ventas</p><p className="text-xl font-bold dark:text-white">{formatCurrency(stats.total, settings.currencySymbol)}</p></Card><Card className="p-4 border-l-4 border-emerald-500 md:col-span-1"><p className="text-xs font-bold uppercase text-slate-400">Ingresos</p><p className="text-xl font-bold text-emerald-600">{formatCurrency(stats.paid, settings.currencySymbol)}</p></Card><Card className="p-4 border-l-4 border-rose-500 md:col-span-1"><p className="text-xs font-bold uppercase text-slate-400">Cobrar</p><p className="text-xl font-bold text-rose-500">{formatCurrency(stats.total-stats.paid, settings.currencySymbol)}</p></Card><Card className="p-4 border-l-4 border-blue-500 md:col-span-1"><p className="text-xs font-bold uppercase text-slate-400">Abiertas</p><p className="text-xl font-bold text-blue-600">{stats.open}</p></Card><Card className="p-4 border-l-4 border-gray-500 md:col-span-1"><p className="text-xs font-bold uppercase text-slate-400">Completas</p><p className="text-xl font-bold text-gray-600 dark:text-gray-300">{stats.completed}</p></Card></div>
+         {mode === 'charts' ? ( <div className="space-y-6 animate-fade-in">{chartLayout === 'combined' ? (<div className="grid grid-cols-1 md:grid-cols-3 gap-6 h-80"><Card className="p-4 md:col-span-2 h-80"><h3 className="font-bold mb-2 dark:text-white">Flujo General</h3><ResponsiveContainer width="100%" height="100%"><ComposedChart data={chartData}><CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#94a3b8"/><XAxis dataKey="name"/><YAxis/><Tooltip contentStyle={{backgroundColor:'#1e293b', border:'none', color:'white'}}/><Legend/>
+               {renderCombinedMainChart()}
+               <Bar dataKey="ingresos" fill="#34d399" name="Cobrado" barSize={20} radius={[4,4,0,0]} />
+               <Line type="monotone" dataKey="deuda" stroke="#f43f5e" name="Deuda" strokeWidth={2} />
+         </ComposedChart></ResponsiveContainer></Card><Card className="p-4 h-80"><h3 className="font-bold mb-2 dark:text-white">Top Productos</h3><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={stats.pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={40} outerRadius={80} fill="#82ca9d" label>{stats.pieData.map((e,i)=><Cell key={i} fill={['#0d9488','#10b981','#14b8a6','#2dd4bf','#5eead4'][i%5]}/>)}</Pie><Tooltip/></PieChart></ResponsiveContainer></Card></div>) : (<div className="grid grid-cols-1 md:grid-cols-3 gap-4 h-80"><Card className="p-4 h-80"><h3 className="font-bold mb-2 dark:text-white text-sm">Ventas</h3><CommonChart dataKey="ventas" color="#0d9488" name="Ventas"/></Card><Card className="p-4 h-80"><h3 className="font-bold mb-2 dark:text-white text-sm">Ingresos</h3><CommonChart dataKey="ingresos" color="#10b981" name="Ingresos"/></Card><Card className="p-4 h-80"><h3 className="font-bold mb-2 dark:text-white text-sm">Por Cobrar</h3><CommonChart dataKey="deuda" color="#f43f5e" name="Deuda"/></Card></div>)}</div> ) : ( 
+            <div className="grid grid-cols-1 gap-3 animate-fade-in">{chartData.map((d,i)=>(
+                <Card key={i} className="overflow-hidden border-l-4 border-l-teal-500">
+                    <div onClick={()=>setExpandedRow(expandedRow===d.name?null:d.name)} className="flex justify-between items-center p-4 cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-700/50 transition">
+                        <div className="flex items-center gap-3"><span className="font-bold dark:text-white text-lg">{d.name}</span> {expandedRow===d.name?<ChevronUp size={18}/>:<ChevronDown size={18}/>}</div>
+                        <div className="flex gap-6 text-sm font-medium hidden md:flex"><span className="text-teal-600">Ventas: {formatCurrency(d.ventas, settings.currencySymbol)}</span><span className="text-emerald-600">Cobrado: {formatCurrency(d.ingresos, settings.currencySymbol)}</span></div>
+                    </div>
+                    {expandedRow===d.name && (
+                        <div className="bg-slate-50 dark:bg-slate-900/50 p-4 border-t dark:border-slate-700 space-y-2">
+                            <p className="text-xs font-bold text-slate-400 uppercase mb-2">Desglose de Operaciones</p>
+                            {groupedOrders[d.name]?.map(o=>(
+                                <div key={o.id} className="border-b dark:border-slate-700 pb-2 mb-2 last:mb-0 last:border-0">
+                                    <div onClick={(e)=>{e.stopPropagation(); setExpandedOrder(expandedOrder===o.id?null:o.id)} } className="flex justify-between text-sm cursor-pointer hover:text-teal-600">
+                                        <span className="flex items-center gap-2">{expandedOrder===o.id?<ChevronUp size={14}/>:<ChevronRight size={14}/>} {o.customerName}</span>
+                                        <span className="font-bold">{formatCurrency(o.total, settings.currencySymbol)}</span>
+                                    </div>
+                                    {expandedOrder===o.id && (
+                                        <div className="ml-6 mt-2 space-y-1 text-xs text-slate-500 dark:text-slate-400 bg-white dark:bg-slate-800 p-2 rounded border dark:border-slate-600">
+                                            {o.items?.map((item, idx) => (
+                                                <div key={idx} className="flex justify-between">
+                                                    <span>{item.qty}x {item.name}</span>
+                                                    <span>{formatCurrency(item.subtotal, settings.currencySymbol)}</span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </Card>
+            ))}</div> 
+         )}
+      </div>
+   );
+};
+
+const ProductsView = ({ products, settings, crud }) => {
+   const [isOpen, setIsOpen] = useState(false);
+   const [edit, setEdit] = useState(null);
+   const [img, setImg] = useState(null);
+   const fileRef = useRef();
+   const save = (e) => {
+      e.preventDefault(); const d = new FormData(e.target);
+      const pl = { name: d.get('name'), price: Number(d.get('price')), material: d.get('material'), description: d.get('description'), dims: {x:Number(d.get('x')),y:Number(d.get('y')),z:Number(d.get('z'))}, image: img||edit?.image||null, updatedAt: serverTimestamp() };
+      edit ? crud('products','upd',pl,edit.id) : crud('products','add',{...pl,createdAt:serverTimestamp()});
+      setIsOpen(false); setEdit(null); setImg(null);
+   };
+   return (
+      <div className="space-y-6">
+         <div className="flex justify-between"><h2 className="text-2xl font-bold dark:text-white">Inventario</h2><button onClick={()=>{setEdit(null);setImg(null);setIsOpen(true)}} className="bg-teal-600 text-white px-4 py-2 rounded flex gap-2 hover:bg-teal-700"><Plus/> Nuevo Modelo</button></div>
+         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">{products.map(p=>(<Card key={p.id} className="overflow-hidden group"><div className="h-40 bg-slate-100 dark:bg-slate-700 relative flex items-center justify-center">{p.image?<img src={p.image} className="w-full h-full object-contain"/>:<Package className="text-slate-300"/>}<div className="absolute inset-0 bg-black/50 hidden group-hover:flex items-center justify-center gap-2"><button onClick={()=>{setEdit(p);setImg(p.image);setIsOpen(true)}} className="bg-white p-2 rounded-full text-teal-600"><Edit size={18}/></button><button onClick={()=>crud('products','del',null,p.id)} className="bg-white p-2 rounded-full text-rose-600"><Trash2 size={18}/></button></div></div><div className="p-3"><p className="font-bold truncate dark:text-white">{p.name}</p><p className="text-xs text-slate-500 dark:text-slate-400">{p.material}</p><p className="font-bold text-teal-600">{formatCurrency(p.price, settings.currencySymbol)}</p></div></Card>))}</div>
+         {isOpen && <div className="fixed inset-0 bg-black/50 z-50 flex justify-center items-center p-4 backdrop-blur-sm"><Card className="w-full max-w-lg p-6 max-h-[90vh] overflow-auto"><h3 className="font-bold text-lg mb-4 dark:text-white">{edit?'Editar':'Nuevo'} Producto</h3><form onSubmit={save} className="space-y-4"><div className="flex gap-4"><div onClick={()=>fileRef.current.click()} className="w-24 h-24 bg-slate-100 dark:bg-slate-700 border-2 border-dashed border-slate-300 dark:border-slate-600 rounded flex items-center justify-center cursor-pointer overflow-hidden shrink-0">{img?<img src={img} className="w-full h-full object-contain"/>:<UploadCloud className="text-slate-400"/>} <input ref={fileRef} type="file" className="hidden" onChange={async(e)=>{if(e.target.files[0]) setImg(await processImage(e.target.files[0]))}}/></div><div className="flex-1 space-y-2"><input name="name" required defaultValue={edit?.name} className="w-full p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Nombre"/><input name="price" type="number" required defaultValue={edit?.price} className="w-full p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Precio Base"/></div></div><div className="grid grid-cols-2 gap-2"><input name="material" defaultValue={edit?.material} className="p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Material"/><input name="description" defaultValue={edit?.description} className="p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Descripción"/></div><label className="text-xs font-bold dark:text-slate-300">Medidas (mm)</label><div className="grid grid-cols-3 gap-2"><input name="x" type="number" defaultValue={edit?.dims?.x} className="p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="X"/><input name="y" type="number" defaultValue={edit?.dims?.y} className="p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Y"/><input name="z" type="number" defaultValue={edit?.dims?.z} className="p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Z"/></div><button className="w-full bg-teal-600 text-white py-3 rounded font-bold hover:bg-teal-700">Guardar</button><button type="button" onClick={()=>setIsOpen(false)} className="w-full bg-slate-200 dark:bg-slate-700 py-2 rounded dark:text-white">Cancelar</button></form></Card></div>}
+      </div>
+   )
+};
+
+const OrdersView = ({ orders, clients, products, settings, user, crud }) => {
+   const [isOpen, setIsOpen] = useState(false);
+   const [edit, setEdit] = useState(null);
+   const [cart, setCart] = useState([]);
+   const [item, setItem] = useState({ qty:1, price:'', time:'1h 0m', color:'', desc: '' });
+   const [editingIndex, setEditingIndex] = useState(-1); 
+   const [cust, setCust] = useState('');
+   const [payAmount, setPayAmount] = useState('');
+   const [payments, setPayments] = useState([]);
+   const [selectorOpen, setSelectorOpen] = useState(false);
+   const [filterStatus, setFilterStatus] = useState('all'); 
+
+   useEffect(() => {
+      if(edit) { 
+         setCust(edit.customerName); 
+         setCart(edit.items); 
+         // Corregido: Si hay 'amountPaid' antiguo, lo convertimos a un pago, si no, usamos el array 'payments'
+         setPayments(edit.payments || (edit.amountPaid ? [{date: edit.createdAt, amount: edit.amountPaid}] : [])); 
+      }
+      else { setCust(''); setCart([]); setPayments([]); }
+      setEditingIndex(-1);
+      setItem({qty:1, price:'', time:'1h 0m', color:'', desc: ''});
+   }, [edit, isOpen]);
+
+   const addOrUpdateItem = () => { 
+      if(!item.name || !item.price) return console.error("Elige producto y precio."); // Corregido a console.error
+      const newItem = {...item, qty: Number(item.qty), price: Number(item.price), subtotal: Number(item.qty) * Number(item.price)};
+      
+      if (editingIndex >= 0) {
+         const newCart = [...cart];
+         newCart[editingIndex] = newItem;
+         setCart(newCart);
+         setEditingIndex(-1);
+      } else {
+         setCart([...cart, newItem]);
+      }
+      setItem({qty:1, price:'', time:'1h 0m', color:'', desc: ''}); 
+   };
+
+   const editCartItem = (index) => {
+      setItem(cart[index]);
+      setEditingIndex(index);
+   };
+
+   const addPayment = () => { if(!payAmount || Number(payAmount) <= 0) return; setPayments([...payments, { date: new Date(), amount: Number(payAmount) }]); setPayAmount(''); };
+   
+   const removeCartItem = (idx) => {
+       if (editingIndex === idx) {
+          setEditingIndex(-1);
+          setItem({qty:1, price:'', time:'1h 0m', color:'', desc: ''});
+       }
+       setCart(cart.filter((_, i) => i !== idx));
+   };
+
+   const save = () => {
+      if(!cart.length) return console.error("Carrito vacío"); // Corregido: Carrito vacío
+      const total = cart.reduce((s,i)=>s+i.subtotal,0);
+      const totalPaid = payments.reduce((s,p)=>s+p.amount,0);
+      const pl = {
+         customId: edit?.customId || generateQuoteId(orders.length),
+         customerName: cust, items: cart, total, 
+         payments: payments, 
+         status: totalPaid>=total?'pagado':(totalPaid>0?'parcial':'pendiente'),
+         sellerName: edit?.sellerName || user.name,
+         updatedAt: serverTimestamp()
+      };
+      edit ? crud('orders','upd',pl,edit.id) : crud('orders','add',{...pl, createdAt: serverTimestamp()});
+      setIsOpen(false);
+   };
+
+   const filteredOrders = orders.filter(o => filterStatus === 'all' ? true : o.status === filterStatus);
+   const modalTotal = cart.reduce((s,i)=>s+i.subtotal,0);
+   const modalPaid = payments.reduce((s,p)=>s+p.amount,0);
+   const modalRest = modalTotal - modalPaid;
+
+   return (
+      <div className="space-y-6">
+         <div className="flex justify-between items-center"><h2 className="text-2xl font-bold dark:text-white">Cotizaciones</h2><button onClick={()=>{setEdit(null);setIsOpen(true)}} className="bg-teal-600 text-white px-4 py-2 rounded flex gap-2 hover:bg-teal-700 shadow-lg"><Plus/> Nueva</button></div>
+         <div className="flex gap-2 overflow-x-auto border-b dark:border-slate-700 pb-1">
+             {/* Corregido: nombres de estados con tilde */}
+             {[{id:'all',l:'Todas',i:List},{id:'pendiente',l:'Pendientes',i:AlertTriangle,c:'text-slate-500'},{id:'parcial',l:'En Proceso',i:Clock,c:'text-blue-500'},{id:'pagado',l:'Completadas',i:CheckCircle,c:'text-emerald-500'}].map(t=><button key={t.id} onClick={()=>setFilterStatus(t.id)} className={`px-4 py-2 flex items-center gap-2 rounded-t border-b-2 whitespace-nowrap transition ${filterStatus===t.id?'border-teal-500 bg-teal-50 dark:bg-slate-700 text-teal-700 dark:text-white':'border-transparent text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800'}`}>{React.cloneElement(<t.i/>, {size: 16, className: filterStatus===t.id?'text-teal-600':t.c})} {t.l}</button>)}
+         </div>
+         <div className="grid grid-cols-1 gap-4">{filteredOrders.map(o=>{
+            const paid = o.payments?.reduce((s,p)=>s+p.amount,0) || o.amountPaid || 0;
+            const debt = o.total - paid;
+            return (
+            <Card key={o.id} className="p-4 border-l-4 border-teal-500 flex flex-col md:flex-row justify-between items-center gap-4">
+               <div className="w-full"><div className="flex justify-between font-bold dark:text-white"><span>{o.customerName}</span><span className="bg-slate-100 dark:bg-slate-700 px-2 rounded text-sm text-teal-700 dark:text-teal-400">{o.customId}</span></div><p className="text-sm text-slate-500">{o.items.length} productos • {o.sellerName}</p></div>
+               <div className="flex items-center gap-4 w-full justify-between md:justify-end">
+                    <div className="text-right">
+                        <p className="font-bold text-teal-600">{formatCurrency(o.total, settings.currencySymbol)}</p>
+                        {debt > 0 && <p className="text-xs font-bold text-rose-500">Resta: {formatCurrency(debt, settings.currencySymbol)}</p>}
+                        <Badge status={o.status}/>
+                    </div>
+                    <div className="flex gap-2"><button onClick={()=>{setEdit(o);setIsOpen(true)}} className="p-2 bg-slate-100 dark:bg-slate-700 rounded text-teal-600"><Edit size={16}/></button><button onClick={()=>crud('orders','del',null,o.id)} className="p-2 bg-slate-100 dark:bg-slate-700 rounded text-rose-600"><Trash2 size={16}/></button></div>
+               </div>
+            </Card>
+         )})}</div>
+
+         {isOpen && <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4 backdrop-blur-sm"><Card className="w-full max-w-2xl max-h-[90vh] overflow-auto p-6 flex flex-col gap-4">
+            <h3 className="font-bold text-lg dark:text-white">{edit?'Editar':'Nueva'} Cotización</h3> {/* Corregido: Cotización */}
+            <div className="grid grid-cols-2 gap-4"><input list="cl" value={cust} onChange={e=>setCust(e.target.value)} className="p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Cliente"/><datalist id="cl">{clients.map(c=><option key={c.id} value={c.name}/>)}</datalist><div className="p-2 bg-slate-100 dark:bg-slate-700 rounded flex items-center justify-center font-bold text-slate-500 dark:text-slate-300">{edit?.customId || 'NM####'}</div></div>
+            
+            <div className={`bg-slate-50 dark:bg-slate-700/50 p-4 rounded border dark:border-slate-600 space-y-3 ${editingIndex >= 0 ? 'ring-2 ring-teal-500' : ''}`}>
+               <div className="flex justify-between items-center">
+                  <p className="text-xs font-bold text-teal-600 uppercase">{editingIndex >= 0 ? 'Editando Ítem...' : 'Agregar Producto'}</p> {/* Corregido: Ítem */}
+                  {editingIndex >= 0 && <button onClick={()=>{setEditingIndex(-1); setItem({qty:1, price:'', time:'1h 0m', color:'', desc: ''})}} className="text-xs text-rose-500 hover:underline">Cancelar Edición</button>} {/* Corregido: Edición */}
+               </div>
+               <div className="relative">
+                  <div onClick={()=>setSelectorOpen(!selectorOpen)} className="w-full p-2 border rounded bg-white dark:bg-slate-700 dark:border-slate-600 flex justify-between items-center cursor-pointer dark:text-white">{item.name || 'Seleccionar...'}<ChevronDown size={16}/></div>
+                  {selectorOpen && <div className="absolute top-full left-0 right-0 bg-white dark:bg-slate-700 border dark:border-slate-600 shadow-xl rounded-b max-h-48 overflow-auto z-10">{products.map(p=>(<div key={p.id} onClick={()=>{setItem({...item, name:p.name, price:p.price, image:p.image, dims:p.dims, desc:p.description}); setSelectorOpen(false);}} className="p-2 hover:bg-teal-50 dark:hover:bg-slate-600 flex gap-2 items-center cursor-pointer border-b dark:border-slate-600 last:border-0"><img src={p.image} className="w-8 h-8 rounded bg-slate-200 object-contain"/> <span className="text-sm dark:text-white">{p.name}</span></div>))}</div>}</div>
+               <div className="grid grid-cols-3 gap-2"><input type="number" value={item.qty} onChange={e=>setItem({...item, qty:e.target.value})} className="p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Cant"/><input type="number" value={item.price} onChange={e=>setItem({...item, price:e.target.value})} className="p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Precio"/><input value={item.color} onChange={e=>setItem({...item, color:e.target.value})} className="p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Color"/></div>
+               <div className="flex items-center gap-2 dark:text-white"><Clock size={16}/><TimePicker value={item.time} onChange={v=>setItem({...item, time:v})}/></div>
+               <button onClick={addOrUpdateItem} className={`w-full text-white py-2 rounded font-bold shadow transition ${editingIndex >= 0 ? 'bg-blue-600 hover:bg-blue-700' : 'bg-teal-600 hover:bg-teal-700'}`}>
+                 {editingIndex >= 0 ? 'Actualizar Ítem' : 'Agregar a la Lista'} {/* Corregido: Ítem */}
+               </button>
+            </div>
+
+            {/* LISTA DE ÍTEMS EDITABLE - ESPACIO AMPLIADO */}
+            <div className="space-y-2 min-h-[300px] max-h-[60vh] overflow-auto border-t pt-2 border-dashed dark:border-slate-600">
+               <p className="text-xs font-bold text-slate-400 uppercase sticky top-0 bg-white dark:bg-slate-800 pb-2 z-10">Desglose (Click editar/borrar)</p>
+               {cart.map((i,idx)=>(
+                 <div key={idx} className={`flex justify-between items-center p-3 rounded text-sm dark:text-white gap-2 border border-transparent shadow-sm transition ${editingIndex === idx ? 'bg-blue-50 dark:bg-blue-900/20 border-blue-200' : 'bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600'}`}>
+                    <div className="flex items-center gap-3">
+                        <span className="font-bold bg-white dark:bg-slate-600 w-8 h-8 flex items-center justify-center rounded shadow-sm text-teal-700 dark:text-teal-300">{i.qty}</span>
+                    </div>
+                    <div className="flex-1 overflow-hidden">
+                       <p className="truncate font-bold text-base">{i.name}</p>
+                       <p className="text-xs text-slate-500 dark:text-slate-400">{i.color} - {i.time}</p>
+                    </div>
+                    <div className="flex items-center gap-4">
+                        <span className="font-bold text-lg">{formatCurrency(i.subtotal, settings.currencySymbol)}</span>
+                        <div className="flex gap-2">
+                           <button onClick={()=>editCartItem(idx)} className="p-2 bg-white dark:bg-slate-600 text-blue-600 rounded hover:bg-blue-50 dark:hover:bg-slate-500 shadow-sm transition" title="Editar"><Edit size={16}/></button>
+                           <button onClick={()=>removeCartItem(idx)} className="p-2 bg-white dark:bg-slate-600 text-rose-600 rounded hover:bg-rose-50 dark:hover:bg-slate-500 shadow-sm transition" title="Eliminar"><Trash2 size={16}/></button>
+                        </div>
+                    </div>
+                 </div>
+               ))}
+               {cart.length === 0 && <div className="flex flex-col items-center justify-center h-full text-slate-400 italic p-8 border-2 border-dashed rounded dark:border-slate-700"><ShoppingCart size={48} className="mb-2 opacity-20"/><p>Tu lista está vacía. Agrega productos arriba.</p></div>}
+            </div>
+            
+            <div className="border-t pt-4 dark:border-slate-600">
+               <div className="grid grid-cols-3 gap-2 mb-4 text-center">
+                   <div className="bg-slate-100 dark:bg-slate-700 p-2 rounded"><p className="text-xs text-slate-500">Total</p><p className="font-bold dark:text-white">{formatCurrency(modalTotal, settings.currencySymbol)}</p></div>
+                   <div className="bg-emerald-100 dark:bg-emerald-900/30 p-2 rounded"><p className="text-xs text-emerald-600">Pagado</p><p className="font-bold text-emerald-600 dark:text-emerald-400">{formatCurrency(modalPaid, settings.currencySymbol)}</p></div>
+                   <div className="bg-rose-100 dark:bg-rose-900/30 p-2 rounded"><p className="text-xs text-rose-600">Falta</p><p className="font-bold text-rose-600 dark:text-rose-400">{formatCurrency(modalRest<0?0:modalRest, settings.currencySymbol)}</p></div>
+               </div>
+               
+               <div className="bg-slate-50 dark:bg-slate-700/30 p-3 rounded space-y-2 border dark:border-slate-600">
+                  <p className="text-xs font-bold text-slate-500 uppercase">Nuevo Abono</p>
+                  <div className="flex gap-2"><input type="number" value={payAmount} onChange={e=>setPayAmount(e.target.value)} className="flex-1 p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Monto"/><button onClick={addPayment} className="bg-teal-600 text-white px-4 rounded font-bold hover:bg-teal-700">Registrar</button></div>
+                  <div className="max-h-24 overflow-auto space-y-1 mt-2">{payments.map((p, i) => (<div key={i} className="flex justify-between text-xs text-slate-500 dark:text-slate-400 border-b dark:border-slate-600 pb-1"><span>{formatDate(p.date)}</span><span>{formatCurrency(p.amount, settings.currencySymbol)}</span></div>))}</div></div>
+            </div>
+            <button onClick={save} className="w-full bg-slate-800 text-white py-3 rounded font-bold hover:bg-slate-900">Guardar Cotización</button>
+            <button onClick={()=>setIsOpen(false)} className="w-full bg-slate-200 dark:bg-slate-700 py-2 rounded dark:text-white">Cancelar</button>
+         </Card></div>}
+      </div>
+   )
+};
+
+const InvoiceView = ({ orders, settings }) => {
+   const [sel, setSel] = useState(null);
+   const [mode, setMode] = useState('grid'); 
+   const print = () => {
+      const el = document.getElementById('inv');
+      // Ajuste de formato para mejor visualización horizontal (paisaje)
+      const opt = { margin:0.2, filename:`${sel.customId}.pdf`, image:{type:'jpeg',quality:0.98}, html2canvas:{scale:2}, jsPDF:{unit:'in',format:'letter',orientation:'landscape'} }; 
+      window.html2pdf().set(opt).from(el).save();
+   };
+   if(sel) {
+      const paid = sel.payments?.reduce((s,p)=>s+p.amount,0) || sel.amountPaid || 0;
+      const remaining = sel.total - paid;
+      return (
+      <div className="fixed inset-0 bg-black/80 z-50 flex justify-center overflow-auto p-4 backdrop-blur-sm">
+         <div className="w-full max-w-[11in] bg-white text-slate-900 p-8 shadow-xl relative h-fit" id="inv">
+            <div className="flex justify-between border-b pb-4 mb-4"><div className="flex items-center gap-4">{settings.logoUrl && <img src={settings.logoUrl} className="h-20 object-contain"/>}<div><h1 className="font-bold text-2xl">{settings.companyName}</h1><p>RNC: {settings.taxId}</p></div></div><div className="text-right"><p><b>No:</b> {sel.customId}</p><p><b>Cliente:</b> {sel.customerName}</p><p><b>Vendedor:</b> {sel.sellerName}</p><p><b>Fecha:</b> {formatDate(sel.createdAt)}</p></div></div>
+            {/* Corregido: Categoría */}
+            <table className="w-full border-collapse border border-slate-300 text-sm"><thead className="bg-[#1ea896] text-white"><tr className="text-center"><th className="p-2 border">Categoría</th><th className="p-2 border">Cant</th><th className="p-2 border w-1/4">Descripción</th><th className="p-2 border">Colores</th><th className="p-2 border">Precio</th><th className="p-2 border">Medidas</th><th className="p-2 border">Tiempo</th><th className="p-2 border">Total</th><th className="p-2 border">Img</th></tr></thead><tbody className="text-center">{sel.items.map((i,idx)=>(<tr key={idx}><td className="p-2 border font-bold">{i.name}</td><td className="p-2 border">{i.qty}</td><td className="p-2 border text-left italic">{i.desc}</td><td className="p-2 border">{i.color}</td><td className="p-2 border">{formatCurrency(i.price, settings.currencySymbol)}</td><td className="p-2 border text-xs">{i.dims?formatDims(i.dims.x,i.dims.y,i.dims.z):'-'}</td><td className="p-2 border">{i.time}</td><td className="p-2 border font-bold">{formatCurrency(i.subtotal, settings.currencySymbol)}</td><td className="p-1 border">{i.image&&<img src={i.image} className="h-10 mx-auto object-contain"/>}</td></tr>))}</tbody></table>
+            <div className="flex justify-between mt-8 pt-4 border-t"><div className="text-xs text-slate-500 w-1/2"><p className="font-bold mb-1">Pagos:</p>{sel.payments?.map((p,i) => <div key={i}>{formatDate(p.date)}: {formatCurrency(p.amount, settings.currencySymbol)}</div>)}</div><div className="text-right"><p className="text-lg font-bold">Total: {formatCurrency(sel.total, settings.currencySymbol)}</p><p className="text-emerald-600 font-bold">Abonado: {formatCurrency(paid, settings.currencySymbol)}</p><p className="text-rose-600 font-bold">Resta: {formatCurrency(remaining < 0 ? 0 : remaining, settings.currencySymbol)}</p></div></div>
+            {settings.invoiceFooter && <div className="mt-8 pt-8 text-center border-t border-slate-200 text-slate-500 text-sm italic">"{settings.invoiceFooter}"</div>}
+            <button onClick={()=>{setSel(null)}} className="absolute top-2 right-20 text-slate-400 hover:text-slate-800"><X/></button><button onClick={print} className="absolute top-2 right-2 bg-teal-600 text-white px-3 py-1 rounded flex gap-2 hover:bg-teal-700"><Download size={16}/> PDF</button>
+         </div>
+      </div>
+   )}
+   return (
+      <div className="space-y-4">
+         <div className="flex justify-between items-center"><h2 className="text-2xl font-bold dark:text-white">Facturas</h2><div className="bg-white dark:bg-slate-800 p-1 rounded border dark:border-slate-700 flex"><button onClick={()=>setMode('grid')} className={`p-2 rounded ${mode==='grid'?'bg-teal-100 text-teal-700':''}`}><Grid size={18}/></button><button onClick={()=>setMode('list')} className={`p-2 rounded ${mode==='list'?'bg-teal-100 text-teal-700':''}`}><List size={18}/></button></div></div>
+         {mode === 'grid' ? ( <div className="grid grid-cols-1 md:grid-cols-3 gap-4">{orders.map(o=><Card key={o.id} className="p-4 cursor-pointer hover:shadow-lg border-l-4 border-teal-400"><div onClick={()=>setSel(o)}><p className="font-bold dark:text-white">{o.customId}</p><p className="dark:text-slate-300">{o.customerName}</p><p className="font-bold text-teal-600">{formatCurrency(o.total, settings.currencySymbol)}</p></div></Card>)}</div> ) : ( <Card className="overflow-hidden"><table className="w-full text-sm text-left dark:text-slate-300"><thead className="bg-slate-100 dark:bg-slate-700"><tr><th className="p-3">ID</th><th className="p-3">Cliente</th><th className="p-3">Fecha</th><th className="p-3 text-right">Total</th><th className="p-3"></th></tr></thead><tbody>{orders.map(o=>(<tr key={o.id} className="border-t dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700/50"><td className="p-3 font-bold">{o.customId}</td><td className="p-3">{o.customerName}</td><td className="p-3">{formatDate(o.createdAt)}</td><td className="p-3 text-right font-bold text-teal-600">{formatCurrency(o.total, settings.currencySymbol)}</td><td className="p-3 text-right"><button onClick={()=>setSel(o)} className="text-slate-400 hover:text-teal-600"><FileText size={18}/></button></td></tr>))}</tbody></table></Card> )}
+      </div>
+   )
+};
+
+const SettingsView = ({ settings, staff, user, updateSet, crud }) => {
+   const [logo, setLogo] = useState(settings.logoUrl);
+   const fileRef = useRef();
+   const [newUser, setNewUser] = useState({ name:'', password:'', role:'user' });
+   const [editingUser, setEditingUser] = useState(null);
+
+   // Sincronizar el estado del logo si la configuración cambia externamente
+   useEffect(() => {
+     setLogo(settings.logoUrl);
+   }, [settings.logoUrl]);
+
+   return (
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+         <Card className="p-6"><h3 className="font-bold text-lg mb-4 dark:text-white">Configuración</h3><form onSubmit={(e)=>{e.preventDefault();const d=new FormData(e.target); updateSet({companyName:d.get('companyName'), taxId:d.get('taxId'), invoiceFooter:d.get('invoiceFooter'), currencySymbol:d.get('currencySymbol'), logoUrl:logo}); console.info("Configuración guardada");}} className="space-y-4"><div className="flex items-center gap-4"><div onClick={()=>fileRef.current.click()} className="w-20 h-20 bg-slate-100 dark:bg-slate-700 border-dashed border-2 border-slate-300 dark:border-slate-600 rounded flex items-center justify-center cursor-pointer">{logo?<img src={logo} className="w-full h-full object-contain"/>:<ImageIcon className="text-slate-400"/>}</div><input ref={fileRef} type="file" className="hidden" onChange={async(e)=>{if(e.target.files[0]) setLogo(await processImage(e.target.files[0]))}}/></div><input name="companyName" defaultValue={settings.companyName} className="w-full p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Empresa"/><input name="taxId" defaultValue={settings.taxId} className="w-full p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="RNC"/><select name="currencySymbol" defaultValue={settings.currencySymbol} className="w-full p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white"><option value="RD$">RD$</option><option value="$">$</option><option value="€">€</option></select><textarea name="invoiceFooter" defaultValue={settings.invoiceFooter} className="w-full p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Pie de página de la factura"/>{user.role==='admin' && <button className="w-full bg-teal-600 text-white py-2 rounded font-bold hover:bg-teal-700">Guardar Configuración</button>}</form></Card>
+         <Card className="p-6"><h3 className="font-bold text-lg mb-4 flex items-center gap-2 dark:text-white"><Shield size={18}/> Usuarios</h3>{user.role==='admin' ? (<><form onSubmit={(e)=>{e.preventDefault(); const data = editingUser ? {name: newUser.name, password: newUser.password, role: newUser.role} : { ...newUser, createdAt:serverTimestamp() }; if(editingUser) { crud('staff','upd',data,editingUser.id); setEditingUser(null); } else { crud('staff','add',data); } setNewUser({name:'',password:'',role:'user'});}} className="bg-slate-50 dark:bg-slate-700/50 p-4 rounded mb-4 space-y-2 border dark:border-slate-600"><p className="text-xs font-bold text-teal-600 uppercase">{editingUser ? 'Editar Usuario' : 'Agregar Nuevo Usuario'}</p><div className="grid grid-cols-2 gap-2"><input value={newUser.name} onChange={e=>setNewUser({...newUser,name:e.target.value})} className="p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Usuario"/><input value={newUser.password} onChange={e=>setNewUser({...newUser,password:e.target.value})} className="p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Clave"/></div><select value={newUser.role} onChange={e=>setNewUser({...newUser,role:e.target.value})} className="w-full p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white"><option value="user">Vendedor</option><option value="admin">Admin</option></select><div className="flex gap-2"><button className="flex-1 bg-slate-800 text-white py-2 rounded font-bold hover:bg-slate-900">{editingUser ? 'Actualizar' : 'Crear'}</button>{editingUser && <button type="button" onClick={()=>{setEditingUser(null); setNewUser({name:'',password:'',role:'user'})}} className="px-4 bg-slate-200 dark:bg-slate-600 rounded">X</button>}</div></form><div className="space-y-2">{staff.map(u=>(<div key={u.id} className="flex justify-between items-center p-3 border rounded dark:border-slate-600 dark:text-slate-300"><div><p className="font-bold">{u.name}</p><p className="text-xs text-slate-500">{u.role}</p></div>{u.name!=='Ernis' && <div className="flex gap-2"><button onClick={()=>{setEditingUser(u); setNewUser({name:u.name, password:u.password, role:u.role})}} className="text-blue-500"><Edit size={16}/></button><button onClick={()=>crud('staff','del',null,u.id)} className="text-rose-500"><Trash2 size={16}/></button></div>}</div>))}</div></>) : <p className="text-center text-slate-500 py-10">Acceso restringido.</p>}</Card>
+      </div>
+   )
+};
+
+const ClientsView = ({ clients, crud }) => {
+   const [isOpen, setIsOpen] = useState(false);
+   const [edit, setEdit] = useState(null);
+   const save = (e) => {
+      e.preventDefault(); const d = new FormData(e.target);
+      const pl = { name: d.get('name'), phone: d.get('phone'), email: d.get('email'), updatedAt: serverTimestamp() };
+      edit ? crud('clients','upd',pl,edit.id) : crud('clients','add',{...pl, createdAt: serverTimestamp()});
+      setIsOpen(false); setEdit(null);
+   };
+   return (
+      <div className="space-y-6"><div className="flex justify-between"><h2 className="text-2xl font-bold dark:text-white">Clientes</h2><button onClick={()=>{setEdit(null);setIsOpen(true)}} className="bg-teal-600 text-white px-4 py-2 rounded flex gap-2 hover:bg-teal-700"><Plus/> Nuevo</button></div><div className="grid grid-cols-1 md:grid-cols-3 gap-4">{clients.map(c=>(<Card key={c.id} className="p-4 relative group"><p className="font-bold text-lg dark:text-white">{c.name}</p><p className="text-sm text-slate-500 dark:text-slate-400">{c.phone || 'Sin teléfono'}</p><div className="absolute top-2 right-2 hidden group-hover:flex gap-2"><button onClick={()=>{setEdit(c);setIsOpen(true)}} className="text-teal-600"><Edit size={16}/></button><button onClick={()=>crud('clients','del',null,c.id)} className="text-rose-600"><Trash2 size={16}/></button></div></Card>))}</div>{isOpen && <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4 backdrop-blur-sm"><Card className="w-full max-w-sm p-6"><h3 className="font-bold text-lg mb-4 dark:text-white">{edit?'Editar':'Nuevo'} Cliente</h3><form onSubmit={save} className="space-y-3"><input name="name" required defaultValue={edit?.name} className="w-full p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Nombre"/><input name="phone" defaultValue={edit?.phone} className="w-full p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Teléfono"/><input name="email" defaultValue={edit?.email} className="w-full p-2 border rounded dark:bg-slate-700 dark:border-slate-600 dark:text-white" placeholder="Email"/><button className="w-full bg-teal-600 text-white py-2 rounded font-bold hover:bg-teal-700">Guardar</button><button type="button" onClick={()=>setIsOpen(false)} className="w-full bg-slate-200 dark:bg-slate-700 py-2 rounded dark:text-white">Cancelar</button></form></Card></div>}</div>
+   );
+};
